@@ -5,7 +5,12 @@ on:
     # Tag protection is mandatory. The job guard below makes an unprotected
     # tag a no-op, so a maintainer cannot route arbitrary tag source to the
     # private runner by merely matching this pattern.
-    tags: ['v2.337.0-arconath.*']
+    tags:
+      - v2.337.0-arconath.1-rc.1
+      - v2.337.0-arconath.1-rc.2
+      - v2.337.0-arconath.1-rc.3
+      - v2.337.0-arconath.1-rc.4
+      - v2.337.0-arconath.1-rc.5
 
 permissions:
   contents: read
@@ -14,7 +19,11 @@ jobs:
   validate-intent:
     if: >-
       github.repository == 'Arconath/hermes-agent' &&
-      startsWith(github.ref, 'refs/tags/v2.337.0-arconath.') &&
+      (github.ref == 'refs/tags/v2.337.0-arconath.1-rc.1' ||
+      github.ref == 'refs/tags/v2.337.0-arconath.1-rc.2' ||
+      github.ref == 'refs/tags/v2.337.0-arconath.1-rc.3' ||
+      github.ref == 'refs/tags/v2.337.0-arconath.1-rc.4' ||
+      github.ref == 'refs/tags/v2.337.0-arconath.1-rc.5') &&
       github.ref_type == 'tag' &&
       github.ref_protected == true &&
       github.event_name == 'push'
@@ -33,7 +42,10 @@ jobs:
           set -Eeuo pipefail
           [[ "$GITHUB_REPOSITORY" == Arconath/hermes-agent ]]
           [[ "$GITHUB_REF_TYPE" == tag ]]
-          [[ "$GITHUB_REF" == refs/tags/v2.337.0-arconath.* ]]
+          case "$GITHUB_REF" in
+            refs/tags/v2.337.0-arconath.1-rc.1|refs/tags/v2.337.0-arconath.1-rc.2|refs/tags/v2.337.0-arconath.1-rc.3|refs/tags/v2.337.0-arconath.1-rc.4|refs/tags/v2.337.0-arconath.1-rc.5) ;;
+            *) echo 'untrusted release tag' >&2; exit 1 ;;
+          esac
           [[ "$GITHUB_REF_PROTECTED" == true ]]
           [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]

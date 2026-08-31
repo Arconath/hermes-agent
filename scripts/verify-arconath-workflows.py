@@ -59,9 +59,11 @@ for workflow in active_workflows:
 
     if workflow.name == "arconath-release.yml":
         required = (
-            "tags: ['v2.337.0-arconath.*']",
+            "- v2.337.0-arconath.1-rc.1",
+            "- v2.337.0-arconath.1-rc.5",
             "github.repository == 'Arconath/hermes-agent'",
-            "startsWith(github.ref, 'refs/tags/v2.337.0-arconath.')",
+            "github.ref == 'refs/tags/v2.337.0-arconath.1-rc.1'",
+            "github.ref == 'refs/tags/v2.337.0-arconath.1-rc.5'",
             "github.ref_type == 'tag'",
             "github.ref_protected == true",
             "github.event_name == 'push'",
