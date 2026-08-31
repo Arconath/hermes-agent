@@ -2,13 +2,22 @@ name: Arconath Hermes release intent
 
 on:
   push:
-    tags: ['v*-arconath.*']
+    # Tag protection is mandatory. The job guard below makes an unprotected
+    # tag a no-op, so a maintainer cannot route arbitrary tag source to the
+    # private runner by merely matching this pattern.
+    tags: ['v2.337.0-arconath.*']
 
 permissions:
   contents: read
 
 jobs:
   validate-intent:
+    if: >-
+      github.repository == 'Arconath/hermes-agent' &&
+      startsWith(github.ref, 'refs/tags/v2.337.0-arconath.') &&
+      github.ref_type == 'tag' &&
+      github.ref_protected == true &&
+      github.event_name == 'push'
     runs-on:
       group: arconath-jit
       labels: [self-hosted, linux, x64, arconath-jit, rootless-buildkit]
@@ -22,7 +31,10 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          [[ "$GITHUB_REPOSITORY" == Arconath/hermes-agent ]]
           [[ "$GITHUB_REF_TYPE" == tag ]]
+          [[ "$GITHUB_REF" == refs/tags/v2.337.0-arconath.* ]]
+          [[ "$GITHUB_REF_PROTECTED" == true ]]
           [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
           [[ -z "${DOCKER_HOST:-}" ]]

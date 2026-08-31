@@ -33,6 +33,46 @@ for workflow in active_workflows:
         if re.search(pattern, workflow_text, flags=re.IGNORECASE):
             fail(f"{workflow.name} contains forbidden {authority}")
 
+    # These workflows run on the private arconath-jit fleet. A public fork
+    # cannot use a broad branch/tag glob, pull-request source, or arbitrary
+    # dispatch input as a trust boundary. The GitHub ref-protection bit is
+    # intentionally required in both the expression and the shell preflight:
+    # an unprotected ref must result in a skipped job, never a private-runner
+    # allocation.
+    if workflow.name == "arconath-contracts.yml":
+        required = (
+            "branches: [main]",
+            "github.repository == 'Arconath/hermes-agent'",
+            "github.ref == 'refs/heads/main'",
+            "github.ref_type == 'branch'",
+            "github.ref_protected == true",
+            'github.event_name == \'push\' || github.event_name == \'workflow_dispatch\'',
+            '[[ "$GITHUB_REF_PROTECTED" == true ]]',
+        )
+        for contract in required:
+            if contract not in workflow_text:
+                fail(f"arconath-contracts.yml is missing protected-ref contract: {contract}")
+        if re.search(r"^\s*pull_request\s*:", workflow_text, flags=re.MULTILINE):
+            fail("arconath-contracts.yml must not schedule pull-request source on private runner")
+        if re.search(r"source_commit|github\.event\.pull_request", workflow_text):
+            fail("arconath-contracts.yml contains arbitrary source selection")
+
+    if workflow.name == "arconath-release.yml":
+        required = (
+            "tags: ['v2.337.0-arconath.*']",
+            "github.repository == 'Arconath/hermes-agent'",
+            "startsWith(github.ref, 'refs/tags/v2.337.0-arconath.')",
+            "github.ref_type == 'tag'",
+            "github.ref_protected == true",
+            "github.event_name == 'push'",
+            '[[ "$GITHUB_REF_PROTECTED" == true ]]',
+        )
+        for contract in required:
+            if contract not in workflow_text:
+                fail(f"arconath-release.yml is missing protected-tag contract: {contract}")
+        if re.search(r"workflow_dispatch|pull_request|source_commit", workflow_text):
+            fail("arconath-release.yml must not support arbitrary source dispatch")
+
 release = RELEASE_WORKFLOW.read_text(encoding="utf-8")
 required_contracts = (
     'artifactClass:"UnsignedHermesAgentReleaseIntent"',

@@ -1,10 +1,8 @@
 name: Arconath Hermes contracts
 
 on:
-  pull_request:
-    branches: [main]
   push:
-    branches: [main, 'arconath/**']
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -12,7 +10,15 @@ permissions:
 
 jobs:
   contracts:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Never schedule a public-fork or arbitrary dispatch commit on the
+    # private runner. The job is only eligible for the protected default ref;
+    # an unprotected checkout is intentionally skipped (fail-closed).
+    if: >-
+      github.repository == 'Arconath/hermes-agent' &&
+      github.ref == 'refs/heads/main' &&
+      github.ref_type == 'branch' &&
+      github.ref_protected == true &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on:
       group: arconath-jit
       labels: [self-hosted, linux, x64, arconath-jit, rootless-buildkit]
@@ -26,6 +32,10 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
+          [[ "$GITHUB_REPOSITORY" == Arconath/hermes-agent ]]
+          [[ "$GITHUB_REF" == refs/heads/main ]]
+          [[ "$GITHUB_REF_TYPE" == branch ]]
+          [[ "$GITHUB_REF_PROTECTED" == true ]]
           [[ -z "${DOCKER_HOST:-}" ]]
           [[ -z "${CONTAINER_HOST:-}" ]]
           [[ ! -S /var/run/docker.sock ]]
