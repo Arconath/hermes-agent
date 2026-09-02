@@ -13,7 +13,7 @@ Arconath portfolio product.
 | Area | State | Evidence | Meaning |
 | --- | --- | --- | --- |
 | Upstream/fork identity | PASS (local exact-base candidate), release review required | [`../ARCONATH_FORK.md`](../ARCONATH_FORK.md) | Runtime target is upstream `v0.20.6`/`5fc308a…`; local backport `7ac3707…` has that exact parent and a stable patch id identical to the newer development patch, but is not pushed, signed, or released |
-| API-edge patches | IMPLEMENTED FOUNDATION | `ARCONATH_FORK.md`, gateway source/tests | Idempotency, SSE replay, and key overlap remain bounded edge behavior; the focused gateway suite passes 29 tests on the current development branch |
+| Maintained patches and readiness validation | IMPLEMENTED FOUNDATION | `ARCONATH_FORK.md`, gateway source/tests | Idempotency, SSE replay, and key overlap remain bounded edge behavior; `c439160…` makes the healthy readiness fixture independent of host disk pressure without changing the production probe or safety checks; the focused gateway suite passes 29 tests on the current development branch |
 | CLI/gateway/TUI/desktop/plugin breadth | IMPLEMENTED UPSTREAM FOUNDATION | source tree, docs, tests/evals | Each surface has its own verification and compatibility boundaries |
 | AgentDeck runtime compatibility | CONTRACTED | AgentDeck integration docs and fork contract | Exact runtime/client release smoke remains required |
 | Upstream security/sync lifecycle | OPEN | fork contract | Weekly/security sync and SLA need ongoing owner evidence |

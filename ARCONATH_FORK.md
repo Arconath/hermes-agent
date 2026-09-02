@@ -11,10 +11,16 @@ The `upstream` remote is fetch-only; production changes live on explicit
 2. Durable, bounded, monotonic SSE event ids with `Last-Event-ID` replay and
    explicit replay-gap failure.
 3. Current/next API bearer-key overlap for coordinated rotation.
+4. Deterministic runtime-readiness validation: the healthy local-runtime fixture
+   isolates disk-pressure reporting from the host filesystem in
+   `tests/gateway/test_readiness.py` (`c439160aa8ab1cb79874771e2c8dec99493a77f8`).
+   This is test-only and does not change readiness production semantics,
+   resource limits, sandbox checks, or runtime behavior.
 
-These changes are API-server edge behavior. They do not add model tools or
-alter prompt construction, provider routing, session history, or terminal
-execution.
+The first three changes are API-server edge behavior. The fourth is a
+validation-only fixture change. None add model tools or alter prompt
+construction, provider routing, session history, terminal execution, resource
+limits, or sandbox checks.
 
 ## Lifecycle
 
@@ -24,7 +30,9 @@ execution.
 - Current development branch `arconath/agentdeck-contracts-v1` applies the
   AgentDeck patch commit `b1d574e2215c5dc48109f57e2768b1c57d97968a`
   on upstream-derived commit `ff3835a630deb1f03054806d91ae5712b76f16d1`.
-  It is not a release artifact for `v0.20.6`.
+  The branch then carries the validation-only readiness fixture follow-up
+  `c439160aa8ab1cb79874771e2c8dec99493a77f8`. It is not a release artifact
+  for `v0.20.6`.
 - Local branch `arconath/agentdeck-contracts-v1-v0.20.6` is the exact-base
   backport candidate at `7ac3707bbf8a069aaae5acce387bc43e2ef5636b`, whose
   parent is the approved `5fc308a70719a83cccdbba4c0e39c23f5a8239d5`.

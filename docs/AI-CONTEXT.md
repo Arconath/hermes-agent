@@ -10,10 +10,14 @@ narrow maintained fork of `NousResearch/hermes-agent`; `ARCONATH_FORK.md` is the
 source of truth for patch inventory, upstream base, owner, sync cadence, SLA,
 compatibility tests, and publication/rollback policy.
 
-The current Arconath patches are API-server edge behavior: durable `/v1/runs`
-idempotency, bounded SSE event IDs/replay, and current/next bearer-key overlap.
-They must not alter prompt construction, provider routing, session history, or
-terminal execution unless a separately reviewed patch says so.
+The current Arconath patches are durable `/v1/runs` idempotency, bounded SSE
+event IDs/replay, and current/next bearer-key overlap. The branch also carries
+the validation-only deterministic readiness fixture at
+`c439160aa8ab1cb79874771e2c8dec99493a77f8`; it isolates host disk pressure in
+the healthy test fixture and does not alter production readiness, resource
+limits, sandbox checks, prompt construction, provider routing, session history,
+or terminal execution. `ARCONATH_FORK.md` remains the source of truth for the
+full patch inventory.
 
 ## Component map
 
