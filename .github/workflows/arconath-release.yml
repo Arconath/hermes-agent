@@ -1,0 +1,91 @@
+name: Arconath Hermes release intent
+
+on:
+  push:
+    # Tag protection is mandatory. The job guard below makes an unprotected
+    # tag a no-op, so a maintainer cannot route arbitrary tag source to the
+    # private runner by merely matching this pattern.
+    tags:
+      - v2.337.0-arconath.1-rc.1
+      - v2.337.0-arconath.1-rc.2
+      - v2.337.0-arconath.1-rc.3
+      - v2.337.0-arconath.1-rc.4
+      - v2.337.0-arconath.1-rc.5
+
+permissions:
+  contents: read
+
+jobs:
+  validate-intent:
+    if: >-
+      github.repository == 'Arconath/hermes-agent' &&
+      (github.ref == 'refs/tags/v2.337.0-arconath.1-rc.1' ||
+      github.ref == 'refs/tags/v2.337.0-arconath.1-rc.2' ||
+      github.ref == 'refs/tags/v2.337.0-arconath.1-rc.3' ||
+      github.ref == 'refs/tags/v2.337.0-arconath.1-rc.4' ||
+      github.ref == 'refs/tags/v2.337.0-arconath.1-rc.5') &&
+      github.ref_type == 'tag' &&
+      github.ref_protected == true &&
+      github.event_name == 'push'
+    runs-on:
+      group: arconath-jit
+      labels: [self-hosted, linux, x64, arconath-jit, rootless-buildkit]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify immutable intent and runner boundary
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$GITHUB_REPOSITORY" == Arconath/hermes-agent ]]
+          [[ "$GITHUB_REF_TYPE" == tag ]]
+          case "$GITHUB_REF" in
+            refs/tags/v2.337.0-arconath.1-rc.1|refs/tags/v2.337.0-arconath.1-rc.2|refs/tags/v2.337.0-arconath.1-rc.3|refs/tags/v2.337.0-arconath.1-rc.4|refs/tags/v2.337.0-arconath.1-rc.5) ;;
+            *) echo 'untrusted release tag' >&2; exit 1 ;;
+          esac
+          [[ "$GITHUB_REF_PROTECTED" == true ]]
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+          [[ -z "${DOCKER_HOST:-}" ]]
+          [[ -z "${CONTAINER_HOST:-}" ]]
+          [[ ! -S /var/run/docker.sock ]]
+          [[ ! -S "/run/user/$(id -u)/docker.sock" ]]
+          [[ "${BUILDKIT_HOST:-}" =~ ^unix:///var/lib/arconath-runner/jobs/job\.[[:alnum:]]+/buildkit/buildkitd\.sock$ ]]
+      - name: Verify contracts
+        run: |
+          set -Eeuo pipefail
+          uv sync --locked --extra dev --extra messaging
+          uv run --locked --extra dev --extra messaging ruff check gateway/platforms/api_server.py tests/gateway/test_api_server_runs.py
+          uv run --locked --extra dev --extra messaging pytest -q tests/gateway/test_api_server_runs.py
+      - name: Build non-publishable OCI validation candidate
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          archive="$RUNNER_TEMP/hermes-agent.oci.tar"
+          buildctl --addr "$BUILDKIT_HOST" build \
+            --frontend dockerfile.v0 \
+            --local context=. \
+            --local dockerfile=. \
+            --opt filename=Dockerfile \
+            --opt platform=linux/amd64 \
+            --output "type=oci,dest=$archive" \
+            --attest type=sbom \
+            --attest type=provenance,mode=max
+          archive_sha="$(sha256sum "$archive" | awk '{print $1}')"
+          jq -n \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg sourceRevision "$GITHUB_SHA" \
+            --arg sourceRef "$GITHUB_REF" \
+            --arg archiveSha256 "sha256:$archive_sha" \
+            '{schemaVersion:1,artifactClass:"UnsignedHermesAgentReleaseIntent",deploymentAllowed:false,signatureState:"unsigned",repository:$repository,sourceRevision:$sourceRevision,sourceRef:$sourceRef,archiveSha256:$archiveSha256,publisher:"Arconath/release-control",registryHost:"registry.arconath.internal",artifactRepository:"registry.arconath.internal/arconath/hermes-agent"}' \
+            >"$RUNNER_TEMP/hermes-agent-release-intent.json"
+          rm -- "$archive"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: unsigned-hermes-agent-release-intent-${{ github.sha }}
+          path: ${{ runner.temp }}/hermes-agent-release-intent.json
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,52 @@
+name: Arconath Hermes contracts
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    # Never schedule a public-fork or arbitrary dispatch commit on the
+    # private runner. The job is only eligible for the protected default ref;
+    # an unprotected checkout is intentionally skipped (fail-closed).
+    if: >-
+      github.repository == 'Arconath/hermes-agent' &&
+      github.ref == 'refs/heads/main' &&
+      github.ref_type == 'branch' &&
+      github.ref_protected == true &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on:
+      group: arconath-jit
+      labels: [self-hosted, linux, x64, arconath-jit, rootless-buildkit]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify isolated private runner
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          [[ "$GITHUB_REPOSITORY" == Arconath/hermes-agent ]]
+          [[ "$GITHUB_REF" == refs/heads/main ]]
+          [[ "$GITHUB_REF_TYPE" == branch ]]
+          [[ "$GITHUB_REF_PROTECTED" == true ]]
+          [[ -z "${DOCKER_HOST:-}" ]]
+          [[ -z "${CONTAINER_HOST:-}" ]]
+          [[ ! -S /var/run/docker.sock ]]
+          [[ ! -S "/run/user/$(id -u)/docker.sock" ]]
+          [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+      - name: Install locked test dependencies
+        run: uv sync --locked --extra dev --extra messaging
+      - name: Lint maintained patch
+        run: uv run --locked --extra dev --extra messaging ruff check gateway/platforms/api_server.py tests/gateway/test_api_server_runs.py
+      - name: Verify AgentDeck compatibility contracts
+        run: uv run --locked --extra dev --extra messaging pytest -q tests/gateway/test_api_server_runs.py
+      - name: Verify no active hosted-runner workflow remains
+        run: python3 scripts/verify-arconath-workflows.py

@@ -16,6 +16,7 @@ Exposes an HTTP server with endpoints:
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
+- GET  /v1/operations/{operation_key} — reconcile a lost run-start response
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/steer      — inject guidance into a running agent
@@ -294,7 +295,13 @@ class ThreadSafeAsyncQueue(asyncio.Queue):
         self._loop_ref = asyncio.get_running_loop()
 
 
-def _sse_frame(data: Any, *, event: str = None, ensure_ascii: bool = True) -> bytes:
+def _sse_frame(
+    data: Any,
+    *,
+    event: str = None,
+    event_id: int | str | None = None,
+    ensure_ascii: bool = True,
+) -> bytes:
     """Encode one SSE frame: optional ``event:`` line, then ``data: <json>\n\n``.
 
     The single source of truth for SSE frame serialization across every
@@ -312,7 +319,8 @@ def _sse_frame(data: Any, *, event: str = None, ensure_ascii: bool = True) -> by
     option exists so every writer shares one helper without changing any
     existing byte stream.
     """
-    prefix = f"event: {event}\n" if event else ""
+    prefix = f"id: {event_id}\n" if event_id is not None else ""
+    prefix += f"event: {event}\n" if event else ""
     return f"{prefix}data: {json.dumps(data, ensure_ascii=ensure_ascii)}\n\n".encode()
 
 
@@ -1110,6 +1118,261 @@ class ResponseStore:
         return row[0] if row else 0
 
 
+class RunStore:
+    """Durable idempotency, status, and replay journal for ``/v1/runs``.
+
+    The API server is intentionally a single runtime process, but clients can
+    disconnect or lose a start acknowledgement.  SQLite gives that process a
+    crash-safe operation index and an append-only, monotonically numbered
+    event stream without coupling the public API to the session database.
+    """
+
+    _NONTERMINAL = ("queued", "running", "waiting_for_approval", "stopping")
+
+    def __init__(self, db_path: str | None = None, *, max_events_per_run: int = 10_000):
+        if db_path is None:
+            try:
+                from hermes_constants import get_hermes_home
+
+                db_path = str(get_hermes_home() / "run_store.db")
+            except Exception:
+                db_path = ":memory:"
+        self._db_path: str | None = db_path if db_path != ":memory:" else None
+        self._max_events_per_run = max(100, int(max_events_per_run))
+        self._lock = threading.RLock()
+        # Durable reconciliation is part of the advertised API contract.  A
+        # production listener must not silently fall back to process memory if
+        # its journal cannot be opened: that would accept mutations while
+        # making lost acknowledgements impossible to reconcile after restart.
+        self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
+        self._conn.row_factory = sqlite3.Row
+        from hermes_state import apply_wal_with_fallback
+
+        apply_wal_with_fallback(self._conn, db_label="run_store.db")
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS runs (
+                run_id TEXT PRIMARY KEY,
+                operation_scope TEXT NOT NULL,
+                operation_key TEXT,
+                request_sha256 TEXT,
+                status_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(operation_scope, operation_key)
+            );
+            CREATE INDEX IF NOT EXISTS runs_updated_at_idx ON runs(updated_at);
+            CREATE TABLE IF NOT EXISTS run_events (
+                run_id TEXT NOT NULL,
+                event_id INTEGER NOT NULL,
+                data_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY(run_id, event_id),
+                FOREIGN KEY(run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+            );
+            """
+        )
+        self._conn.commit()
+        self._tighten_file_permissions()
+        self._mark_interrupted_runs_unknown()
+
+    def _tighten_file_permissions(self) -> None:
+        if not self._db_path:
+            return
+        for candidate in (
+            Path(self._db_path),
+            Path(f"{self._db_path}-wal"),
+            Path(f"{self._db_path}-shm"),
+        ):
+            try:
+                if candidate.exists():
+                    candidate.chmod(0o600)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"cannot restrict run store permissions: {candidate.name}"
+                ) from exc
+
+    def _mark_interrupted_runs_unknown(self) -> None:
+        """Turn pre-restart in-flight rows into an explicit unknown outcome."""
+        now = time.time()
+        with self._lock, self._conn:
+            rows = self._conn.execute("SELECT run_id, status_json FROM runs").fetchall()
+            for row in rows:
+                try:
+                    status = json.loads(row["status_json"])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if status.get("status") not in self._NONTERMINAL:
+                    continue
+                status.update(
+                    {
+                        "status": "unknown",
+                        "updated_at": now,
+                        "last_event": "run.outcome_unknown",
+                        "reconciliation_reason": "runtime_restarted",
+                    }
+                )
+                self._conn.execute(
+                    "UPDATE runs SET status_json = ?, updated_at = ? WHERE run_id = ?",
+                    (json.dumps(status, default=str), now, row["run_id"]),
+                )
+
+    def claim_operation(
+        self,
+        *,
+        scope: str,
+        operation_key: str | None,
+        request_sha256: str,
+        run_id: str,
+        status: Dict[str, Any],
+    ) -> tuple[str, bool, bool]:
+        """Atomically claim a key.
+
+        Returns ``(run_id, replay, conflict)``.  A missing operation key still
+        records the run, but has no deduplication semantics.
+        """
+        now = time.time()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if operation_key:
+                    existing = self._conn.execute(
+                        "SELECT run_id, request_sha256 FROM runs "
+                        "WHERE operation_scope = ? AND operation_key = ?",
+                        (scope, operation_key),
+                    ).fetchone()
+                    if existing is not None:
+                        self._conn.commit()
+                        return (
+                            str(existing["run_id"]),
+                            True,
+                            not hmac.compare_digest(
+                                str(existing["request_sha256"] or ""), request_sha256
+                            ),
+                        )
+                self._conn.execute(
+                    "INSERT INTO runs "
+                    "(run_id, operation_scope, operation_key, request_sha256, status_json, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        run_id,
+                        scope,
+                        operation_key,
+                        request_sha256,
+                        json.dumps(status, default=str),
+                        now,
+                        now,
+                    ),
+                )
+                self._conn.commit()
+                self._tighten_file_permissions()
+                return run_id, False, False
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def put_status(self, run_id: str, status: Dict[str, Any]) -> None:
+        now = float(status.get("updated_at", time.time()) or time.time())
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE runs SET status_json = ?, updated_at = ? WHERE run_id = ?",
+                (json.dumps(status, default=str), now, run_id),
+            )
+
+    def get_status(self, run_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status_json FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return json.loads(row["status_json"])
+        except (TypeError, json.JSONDecodeError):
+            return None
+
+    def get_by_operation(self, scope: str, operation_key: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status_json FROM runs WHERE operation_scope = ? AND operation_key = ?",
+                (scope, operation_key),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return json.loads(row["status_json"])
+        except (TypeError, json.JSONDecodeError):
+            return None
+
+    def append_event(self, run_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT COALESCE(MAX(event_id), 0) + 1 AS next_id "
+                    "FROM run_events WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                event_id = int(row["next_id"])
+                durable = dict(event)
+                durable["event_id"] = event_id
+                self._conn.execute(
+                    "INSERT INTO run_events (run_id, event_id, data_json, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (run_id, event_id, json.dumps(durable, default=str), time.time()),
+                )
+                cutoff = event_id - self._max_events_per_run
+                if cutoff > 0:
+                    self._conn.execute(
+                        "DELETE FROM run_events WHERE run_id = ? AND event_id <= ?",
+                        (run_id, cutoff),
+                    )
+                self._conn.commit()
+                return durable
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def events_after(self, run_id: str, event_id: int) -> list[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT data_json FROM run_events WHERE run_id = ? AND event_id > ? "
+                "ORDER BY event_id ASC",
+                (run_id, event_id),
+            ).fetchall()
+        events: list[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                events.append(json.loads(row["data_json"]))
+            except (TypeError, json.JSONDecodeError):
+                logger.warning("Ignoring corrupt run event for run_id=%s", run_id)
+        return events
+
+    def delete_terminal_before(self, cutoff: float) -> None:
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                "SELECT run_id, status_json FROM runs WHERE updated_at < ?", (cutoff,)
+            ).fetchall()
+            for row in rows:
+                try:
+                    terminal = json.loads(row["status_json"]).get("status") in {
+                        "completed",
+                        "failed",
+                        "cancelled",
+                        "unknown",
+                    }
+                except (TypeError, json.JSONDecodeError):
+                    terminal = True
+                if terminal:
+                    self._conn.execute("DELETE FROM run_events WHERE run_id = ?", (row["run_id"],))
+                    self._conn.execute("DELETE FROM runs WHERE run_id = ?", (row["run_id"],))
+
+    def close(self) -> None:
+        with self._lock:
+            with suppress(Exception):
+                self._conn.close()
+
+
 # ---------------------------------------------------------------------------
 # CORS middleware
 # ---------------------------------------------------------------------------
@@ -1509,6 +1772,9 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", _get_scoped_secret("API_SERVER_KEY", ""))
+        self._api_key_next: str = extra.get(
+            "next_key", _get_scoped_secret("API_SERVER_KEY_NEXT", "")
+        )
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -1547,6 +1813,7 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        self._run_store = RunStore(db_path=extra.get("_run_store_path"))
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
@@ -1895,18 +2162,28 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _expected_api_key(self) -> str:
         """Return the API key authorized for the URL-selected profile."""
+        keys = self._expected_api_keys()
+        return keys[0] if keys else ""
+
+    def _expected_api_keys(self) -> tuple[str, ...]:
+        """Return current and staged API keys for overlap-safe rotation."""
         profile = _api_request_profile.get()
         if not profile or profile == "default":
-            return self._api_key
+            return tuple(dict.fromkeys(key for key in (self._api_key, self._api_key_next) if key))
 
         try:
             from agent.secret_scope import get_secret
             from hermes_cli.auth import has_usable_secret
 
             key = get_secret("API_SERVER_KEY", "") or ""
-            if not has_usable_secret(key, min_length=16):
-                return ""
-            return key
+            next_key = get_secret("API_SERVER_KEY_NEXT", "") or ""
+            return tuple(
+                dict.fromkeys(
+                    candidate
+                    for candidate in (key, next_key)
+                    if has_usable_secret(candidate, min_length=16)
+                )
+            )
         except Exception as exc:
             # Fail closed if the profile scope or strength guard cannot resolve
             # the credential. Do not log the key or exception text.
@@ -1915,7 +2192,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 profile,
                 type(exc).__name__,
             )
-            return ""
+            return ()
 
     def _check_auth(self, request: "web.Request") -> Optional["web.Response"]:
         """
@@ -1927,8 +2204,8 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         profile = _api_request_profile.get()
         is_named_profile = bool(profile and profile != "default")
-        expected_key = self._expected_api_key()
-        if not expected_key:
+        expected_keys = self._expected_api_keys()
+        if not expected_keys:
             # Preserve the historical no-key test/manual-wiring behavior only
             # for the default listener. Named profiles must fail closed rather
             # than inherit the listener owner's key.
@@ -1960,7 +2237,10 @@ class APIServerAdapter(BasePlatformAdapter):
             # otherwise crash this handler (500) instead of returning a clean
             # 401. Encoding both sides keeps the timing-safe comparison and
             # matches web_server.py's dashboard-token check.
-            if hmac.compare_digest(token.encode(), expected_key.encode()):
+            if any(
+                hmac.compare_digest(token.encode(), expected_key.encode())
+                for expected_key in expected_keys
+            ):
                 return None  # Auth OK
 
         logger.warning(
@@ -2265,6 +2545,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
             ("POST", "/v1/runs", self._handle_runs),
+            ("GET", "/v1/operations/{operation_key}", self._handle_get_operation),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
@@ -3345,6 +3626,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_api": True,
                 "responses_streaming": True,
                 "run_submission": True,
+                "run_idempotency": True,
+                "run_operation_lookup": True,
+                "run_events_replay": True,
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
@@ -3402,8 +3686,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
+                "run_operation": {
+                    "method": "GET",
+                    "path": "/v1/operations/{operation_key}",
+                },
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
-                "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
+                "run_events": {
+                    "method": "GET",
+                    "path": "/v1/runs/{run_id}/events",
+                    "event_ids": True,
+                    "last_event_id_replay": True,
+                },
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
@@ -7480,7 +7773,36 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
-    _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
+    _RUN_STATUS_TTL = 86_400  # retain idempotency/status reconciliation for 24h
+    _OPERATION_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+    @staticmethod
+    def _operation_scope() -> str:
+        return _api_request_profile.get() or "default"
+
+    def _validated_operation_key(
+        self, request: "web.Request", body: Dict[str, Any]
+    ) -> tuple[str | None, Optional["web.Response"]]:
+        header_key = request.headers.get("Idempotency-Key", "").strip()
+        body_key = str(body.get("operation_id") or "").strip()
+        if header_key and body_key and not hmac.compare_digest(header_key, body_key):
+            return None, web.json_response(
+                _openai_error(
+                    "Idempotency-Key and operation_id must match",
+                    code="operation_key_mismatch",
+                ),
+                status=400,
+            )
+        operation_key = header_key or body_key or None
+        if operation_key and not self._OPERATION_KEY_RE.fullmatch(operation_key):
+            return None, web.json_response(
+                _openai_error(
+                    "Operation key must be 1-128 safe ASCII characters",
+                    code="invalid_operation_key",
+                ),
+                status=400,
+            )
+        return operation_key, None
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
@@ -7495,7 +7817,21 @@ class APIServerAdapter(BasePlatformAdapter):
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
         self._run_statuses[run_id] = current
+        self._run_store.put_status(run_id, current)
         return current
+
+    def _record_run_event(
+        self,
+        run_id: str,
+        event: Dict[str, Any],
+        *,
+        queue: Optional["asyncio.Queue[Optional[Dict]]"] = None,
+    ) -> Dict[str, Any]:
+        durable = self._run_store.append_event(run_id, event)
+        target = queue if queue is not None else self._run_streams.get(run_id)
+        if target is not None:
+            target.put_nowait(durable)
+        return durable
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
@@ -7505,11 +7841,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._run_statuses.get(run_id, {}).get("status", "running"),
                 last_event=event.get("event"),
             )
-            q = self._run_streams.get(run_id)
-            if q is None:
+            if run_id not in self._run_streams:
                 return
             try:
-                loop.call_soon_threadsafe(q.put_nowait, event)
+                loop.call_soon_threadsafe(self._record_run_event, run_id, event)
             except Exception:
                 pass
 
@@ -7677,6 +8012,23 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
+        operation_key, operation_error = self._validated_operation_key(request, body)
+        if operation_error is not None:
+            return operation_error
+        fingerprint_body = dict(body)
+        fingerprint_body.pop("operation_id", None)
+        request_sha256 = hashlib.sha256(
+            json.dumps(
+                {
+                    "body": fingerprint_body,
+                    "session_key": gateway_session_key or "",
+                    "scope": self._operation_scope(),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
@@ -7689,6 +8041,48 @@ class APIServerAdapter(BasePlatformAdapter):
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
         created_at = time.time()
+        initial_status = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "queued",
+            "created_at": created_at,
+            "updated_at": created_at,
+            "session_id": session_id,
+            "model": body.get("model", self._model_name),
+        }
+        if operation_key:
+            initial_status["operation_id"] = operation_key
+        claimed_run_id, replay, conflict = self._run_store.claim_operation(
+            scope=self._operation_scope(),
+            operation_key=operation_key,
+            request_sha256=request_sha256,
+            run_id=run_id,
+            status=initial_status,
+        )
+        if conflict:
+            return web.json_response(
+                _openai_error(
+                    "Operation key was already used with a different request",
+                    code="idempotency_conflict",
+                ),
+                status=409,
+            )
+        if replay:
+            previous = self._run_store.get_status(claimed_run_id) or {
+                "object": "hermes.run",
+                "run_id": claimed_run_id,
+                "status": "unknown",
+            }
+            return web.json_response(
+                {
+                    "run_id": claimed_run_id,
+                    "status": previous.get("status", "unknown"),
+                    "operation_id": operation_key,
+                    "idempotent_replay": True,
+                },
+                status=200,
+            )
+        self._run_statuses[run_id] = initial_status
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
@@ -7698,7 +8092,10 @@ class APIServerAdapter(BasePlatformAdapter):
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
             if self._run_streams.get(run_id) is q:
-                q.put_nowait(event)
+                if event is None:
+                    q.put_nowait(None)
+                else:
+                    self._record_run_event(run_id, event, queue=q)
 
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
@@ -8014,10 +8411,37 @@ class APIServerAdapter(BasePlatformAdapter):
             {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
         )
         return web.json_response(
-            {"run_id": run_id, "status": "started"},
+            {
+                "run_id": run_id,
+                "status": "started",
+                **({"operation_id": operation_key} if operation_key else {}),
+                "idempotent_replay": False,
+            },
             status=202,
             headers=response_headers,
         )
+
+    async def _handle_get_operation(self, request: "web.Request") -> "web.Response":
+        """Resolve a lost start acknowledgement by its operation key."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        operation_key = request.match_info["operation_key"].strip()
+        if not self._OPERATION_KEY_RE.fullmatch(operation_key):
+            return web.json_response(
+                _openai_error("Invalid operation key", code="invalid_operation_key"),
+                status=400,
+            )
+        status = self._run_store.get_by_operation(self._operation_scope(), operation_key)
+        if status is None:
+            return web.json_response(
+                _openai_error(
+                    f"Operation not found: {operation_key}",
+                    code="operation_not_found",
+                ),
+                status=404,
+            )
+        return web.json_response(status)
 
     async def _handle_get_run(self, request: "web.Request") -> "web.Response":
         """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
@@ -8026,7 +8450,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
-        status = self._run_statuses.get(run_id)
+        status = self._run_statuses.get(run_id) or self._run_store.get_status(run_id)
         if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
@@ -8035,22 +8459,46 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response(status)
 
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
-        """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
+        """Replay and then tail the durable run event journal."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
 
         run_id = request.match_info["run_id"]
+        raw_last_event_id = request.headers.get("Last-Event-ID", "").strip() or "0"
+        if not raw_last_event_id.isdigit():
+            return web.json_response(
+                _openai_error(
+                    "Last-Event-ID must be a non-negative integer",
+                    code="invalid_last_event_id",
+                ),
+                status=400,
+            )
+        cursor = int(raw_last_event_id)
+        status = self._run_statuses.get(run_id) or self._run_store.get_status(run_id)
+        if status is None:
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
+        if run_id in self._run_stream_subscribers:
+            return web.json_response(
+                _openai_error(
+                    "Run already has an active event subscriber",
+                    code="run_stream_already_connected",
+                ),
+                status=409,
+            )
 
-        # Allow subscribing slightly before the run is registered (race condition window)
-        for _ in range(20):
-            if run_id in self._run_streams:
-                break
-            await asyncio.sleep(0.05)
-        else:
-            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
-
-        q = self._run_streams[run_id]
+        replay = self._run_store.events_after(run_id, cursor)
+        if replay and int(replay[0].get("event_id", 0)) > cursor + 1:
+            return web.json_response(
+                _openai_error(
+                    "Requested event history has expired; reconcile from run status",
+                    code="event_replay_gap",
+                ),
+                status=409,
+            )
         self._run_stream_subscribers.add(run_id)
 
         response = web.StreamResponse(
@@ -8065,23 +8513,53 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             while True:
+                events = replay
+                replay = []
+                if not events:
+                    events = self._run_store.events_after(run_id, cursor)
+                for event in events:
+                    event_id = int(event.get("event_id", 0))
+                    if event_id <= cursor:
+                        continue
+                    await response.write(_sse_frame(event, event_id=event_id))
+                    cursor = event_id
+
+                status = self._run_statuses.get(run_id) or self._run_store.get_status(run_id)
+                if status and status.get("status") in {
+                    "completed",
+                    "failed",
+                    "cancelled",
+                    "unknown",
+                }:
+                    # A final journal query closes the append/read race before
+                    # ending a terminal stream.
+                    final_events = self._run_store.events_after(run_id, cursor)
+                    if final_events:
+                        replay = final_events
+                        continue
+                    await response.write(b": stream closed\n\n")
+                    break
+
+                q = self._run_streams.get(run_id)
+                if q is None:
+                    await asyncio.sleep(0.25)
+                    continue
                 try:
                     event = await asyncio.wait_for(q.get(), timeout=30.0)
                 except asyncio.TimeoutError:
                     await response.write(b": keepalive\n\n")
                     continue
                 if event is None:
-                    # Run finished — send final SSE comment and close
-                    await response.write(b": stream closed\n\n")
-                    break
-                payload = _sse_frame(event)
-                await response.write(payload)
+                    continue
+                event_id = int(event.get("event_id", 0))
+                if event_id <= cursor:
+                    continue
+                await response.write(_sse_frame(event, event_id=event_id))
+                cursor = event_id
         except Exception as exc:
             logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
         finally:
             self._run_stream_subscribers.discard(run_id)
-            self._run_streams.pop(run_id, None)
-            self._run_streams_created.pop(run_id, None)
 
         return response
 
@@ -8157,13 +8635,13 @@ class APIServerAdapter(BasePlatformAdapter):
         q = self._run_streams.get(run_id)
         if q is not None:
             try:
-                q.put_nowait({
+                self._record_run_event(run_id, {
                     "event": "approval.responded",
                     "run_id": run_id,
                     "timestamp": time.time(),
                     "choice": choice,
                     "resolved": resolved,
-                })
+                }, queue=q)
             except Exception:
                 pass
 
@@ -8226,12 +8704,12 @@ class APIServerAdapter(BasePlatformAdapter):
         q = self._run_streams.get(run_id)
         if q is not None:
             with suppress(Exception):
-                q.put_nowait({
+                self._record_run_event(run_id, {
                     "event": "run.steered",
                     "run_id": run_id,
                     "timestamp": time.time(),
                     "accepted": True,
-                })
+                }, queue=q)
         return web.json_response({"object": "hermes.run.steer", "run_id": run_id, "accepted": True})
 
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
@@ -8308,11 +8786,12 @@ class APIServerAdapter(BasePlatformAdapter):
         stale_statuses = [
             run_id
             for run_id, status in list(self._run_statuses.items())
-            if status.get("status") in {"completed", "failed", "cancelled"}
+            if status.get("status") in {"completed", "failed", "cancelled", "unknown"}
             and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+        self._run_store.delete_terminal_before(now - self._RUN_STATUS_TTL)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
@@ -8356,6 +8835,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 self.name, self._host,
             )
             return False
+        if self._api_key_next:
+            if not has_usable_secret(self._api_key_next, min_length=16):
+                logger.error(
+                    "[%s] Refusing to start: API_SERVER_KEY_NEXT is a placeholder "
+                    "or too short (<16 chars).",
+                    self.name,
+                )
+                return False
+            if hmac.compare_digest(self._api_key.encode(), self._api_key_next.encode()):
+                logger.error(
+                    "[%s] Refusing to start: API_SERVER_KEY_NEXT must differ from "
+                    "API_SERVER_KEY during rotation.",
+                    self.name,
+                )
+                return False
         return True
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -8540,6 +9034,13 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 logger.debug(
                     "Failed to close response store for %s", self.name, exc_info=True,
+                )
+        if self._run_store is not None:
+            try:
+                self._run_store.close()
+            except Exception:
+                logger.debug(
+                    "Failed to close run store for %s", self.name, exc_info=True,
                 )
         try:
             if self._site:

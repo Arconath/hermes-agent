@@ -10,6 +10,7 @@ Covers:
 """
 
 import asyncio
+import sqlite3
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -21,6 +22,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    RunStore,
     _approval_event_choices,
     cors_middleware,
     security_headers_middleware,
@@ -59,7 +61,7 @@ def test_approval_event_choices_follow_backend_capabilities(
 
 def _make_adapter(api_key: str = "") -> APIServerAdapter:
     """Create an adapter with optional API key."""
-    extra = {}
+    extra = {"_run_store_path": ":memory:"}
     if api_key:
         extra["key"] = api_key
     config = PlatformConfig(enabled=True, extra=extra)
@@ -73,6 +75,7 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
     app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_get("/v1/operations/{operation_key}", adapter._handle_get_operation)
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
@@ -152,6 +155,53 @@ class TestStartRun:
                 assert status["run_id"] == data["run_id"]
                 assert status["status"] in {"queued", "running", "completed"}
                 assert status["object"] == "hermes.run"
+
+    @pytest.mark.asyncio
+    async def test_start_is_idempotent_and_operation_is_reconcilable(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                agent, ready, interrupted = _make_slow_agent()
+                mock_create.return_value = agent
+                headers = {"Idempotency-Key": "mission-01HZZZZZZZZZZZZZZZZZZZZZZZ"}
+                first = await cli.post("/v1/runs", json={"input": "hello"}, headers=headers)
+                first_data = await first.json()
+                ready.wait(timeout=3)
+
+                replay = await cli.post("/v1/runs", json={"input": "hello"}, headers=headers)
+                replay_data = await replay.json()
+                lookup = await cli.get(
+                    "/v1/operations/mission-01HZZZZZZZZZZZZZZZZZZZZZZZ"
+                )
+                lookup_data = await lookup.json()
+
+                assert first.status == 202
+                assert replay.status == 200
+                assert replay_data["idempotent_replay"] is True
+                assert replay_data["run_id"] == first_data["run_id"]
+                assert lookup.status == 200
+                assert lookup_data["run_id"] == first_data["run_id"]
+                assert mock_create.call_count == 1
+                interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_idempotency_key_rejects_payload_conflict(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                agent, ready, interrupted = _make_slow_agent()
+                mock_create.return_value = agent
+                headers = {"Idempotency-Key": "operation-conflict"}
+                first = await cli.post("/v1/runs", json={"input": "first"}, headers=headers)
+                ready.wait(timeout=3)
+                conflict = await cli.post("/v1/runs", json={"input": "second"}, headers=headers)
+                data = await conflict.json()
+
+                assert first.status == 202
+                assert conflict.status == 409
+                assert data["error"]["code"] == "idempotency_conflict"
+                assert mock_create.call_count == 1
+                interrupted.set()
 
     @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):
@@ -338,6 +388,16 @@ class TestRunEvents:
                 # Should contain run.completed
                 assert "run.completed" in body
                 assert "Hello!" in body
+                assert "id: 1" in body
+
+                replay_resp = await cli.get(
+                    f"/v1/runs/{run_id}/events",
+                    headers={"Last-Event-ID": "0"},
+                )
+                replay_body = await replay_resp.text()
+                assert replay_resp.status == 200
+                assert "run.completed" in replay_body
+                assert "id: 1" in replay_body
 
 
     @pytest.mark.asyncio
@@ -570,6 +630,46 @@ class TestSteerRun:
             resp = await cli.post("/v1/runs/run_any/steer", json={"input": "hello"})
 
         assert resp.status == 401
+
+
+class TestAPIKeyRotation:
+    @pytest.mark.asyncio
+    async def test_current_and_next_key_overlap(self):
+        adapter = APIServerAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "key": "current-key-0123456789abcdef",
+                    "next_key": "next-key-0123456789abcdef",
+                    "_run_store_path": ":memory:",
+                },
+            )
+        )
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            current = await cli.get(
+                "/v1/operations/not-found",
+                headers={"Authorization": "Bearer current-key-0123456789abcdef"},
+            )
+            staged = await cli.get(
+                "/v1/operations/not-found",
+                headers={"Authorization": "Bearer next-key-0123456789abcdef"},
+            )
+            rejected = await cli.get(
+                "/v1/operations/not-found",
+                headers={"Authorization": "Bearer retired-key-0123456789abcdef"},
+            )
+
+        assert current.status == 404
+        assert staged.status == 404
+        assert rejected.status == 401
+        assert adapter._api_key_passes_startup_guard() is True
+
+
+def test_run_store_fails_closed_when_durable_journal_cannot_open(tmp_path):
+    missing_parent = tmp_path / "missing" / "run_store.db"
+    with pytest.raises(sqlite3.OperationalError):
+        RunStore(str(missing_parent))
 
 
 # ---------------------------------------------------------------------------
