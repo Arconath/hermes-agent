@@ -1,0 +1,25 @@
+%% Sources: AGENTS.md; ARCONATH_FORK.md; run_agent.py; model_tools.py; gateway/; ui-tui/; apps/desktop/; plugins/; skills/
+flowchart TB
+  cli["Classic CLI"] --> core["AIAgent core<br/>run_agent.py"]
+  tui["Ink TUI + Python gateway"] --> core
+  desktop["Electron desktop<br/>apps/desktop"] --> core
+  channels["Messaging gateway<br/>gateway/platforms"] --> core
+  core --> tools["model_tools.py + tool registry<br/>narrow waist"]
+  core --> providers["Provider adapters<br/>plugins/model-providers"]
+  core --> memory["Memory + skills<br/>plugins/memory · skills/"]
+  core --> terminal["Terminal + browser tools<br/>bounded environments"]
+  plugins["Plugins / optional skills<br/>capabilities at the edges"] --> tools
+  upstream["NousResearch upstream<br/>maintained fork relationship"] -. sync / patch inventory .-> core
+  cache["Prompt cache invariant<br/>system prefix stable per conversation"] -. constrains .-> core
+  blocker["Fork lifecycle<br/>upstream sync · compatibility · publication<br/>not evidenced"] -.-> upstream
+
+  classDef client fill:#e8f1ff,stroke:#2563eb,color:#0f172a;
+  classDef core fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e;
+  classDef edge fill:#ecfdf5,stroke:#059669,color:#064e3b;
+  classDef boundary fill:#f3e8ff,stroke:#7c3aed,color:#3b0764;
+  classDef blocked fill:#fff7ed,stroke:#ea580c,color:#7c2d12;
+  class cli,tui,desktop,channels client;
+  class core,tools core;
+  class providers,memory,terminal,plugins edge;
+  class upstream,cache boundary;
+  class blocker blocked;

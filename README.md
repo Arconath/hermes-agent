@@ -262,3 +262,16 @@ scripts/run_tests.sh
 MIT — see [LICENSE](LICENSE).
 
 Built by [Nous Research](https://nousresearch.com).
+
+## Arconath maintainer documentation
+
+This checkout is the maintained Arconath fork used as a platform/runtime
+dependency. The upstream README above remains useful for end-user Hermes
+usage; these links describe the Arconath patch boundary and integration rules.
+
+- [Documentation index](docs/README.md)
+- [AI/agent context](docs/AI-CONTEXT.md)
+- [Current status and blockers](docs/STATUS.md)
+- [Fork contract and patch inventory](ARCONATH_FORK.md)
+- [Architecture decisions](docs/ADR.md)
+- [AgentDeck/runtime contract](../../../products/agentdeck/docs/hermes-integration.md)

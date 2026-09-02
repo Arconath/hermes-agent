@@ -19,8 +19,19 @@ execution.
 ## Lifecycle
 
 - Owner: Arconath platform runtime team.
-- Upstream base: `NousResearch/hermes-agent` release `v0.20.6`, commit
-  `5fc308a70719a83cccdbba4c0e39c23f5a8239d5`.
+- Runtime compatibility target: `NousResearch/hermes-agent` release `v0.20.6`,
+  commit `5fc308a70719a83cccdbba4c0e39c23f5a8239d5`.
+- Current development branch `arconath/agentdeck-contracts-v1` applies the
+  AgentDeck patch commit `b1d574e2215c5dc48109f57e2768b1c57d97968a`
+  on upstream-derived commit `ff3835a630deb1f03054806d91ae5712b76f16d1`.
+  It is not a release artifact for `v0.20.6`.
+- Local branch `arconath/agentdeck-contracts-v1-v0.20.6` is the exact-base
+  backport candidate at `7ac3707bbf8a069aaae5acce387bc43e2ef5636b`, whose
+  parent is the approved `5fc308a70719a83cccdbba4c0e39c23f5a8239d5`.
+  Its stable patch id matches `b1d574e…`; workflow-authority validation and the
+  focused 29-test AgentDeck run-contract suite pass. It remains local,
+  unreviewed as a release, unpublished, and unsigned. Production still requires
+  the full compatibility packet plus signed publication through release-control.
 - Sync cadence: weekly and immediately for upstream security advisories.
 - Security SLA: critical 24 hours, high 72 hours, other supported fixes 14 days.
 - Compatibility gate: focused upstream API-server tests plus AgentDeck's
