@@ -274,4 +274,4 @@ usage; these links describe the Arconath patch boundary and integration rules.
 - [Current status and blockers](docs/STATUS.md)
 - [Fork contract and patch inventory](ARCONATH_FORK.md)
 - [Architecture decisions](docs/ADR.md)
-- [AgentDeck/runtime contract](../../../products/agentdeck/docs/hermes-integration.md)
+- [AgentDeck/runtime contract](https://github.com/Arconath/agentdeck/blob/main/docs/hermes-integration.md)

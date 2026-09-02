@@ -16,7 +16,7 @@ an Arconath maintained fork; it is not a new portfolio product.
 | Desktop surface | [`../apps/desktop/README.md`](../apps/desktop/README.md), nested `AGENTS.md`, and `DESIGN.md` |
 | Plugins/providers/skills | [`../plugins`](../plugins), [`../providers/README.md`](../providers/README.md), [`../skills`](../skills), and upstream website docs |
 | Tests/evals | [`../tests`](../tests), [`../tests-js`](../tests-js), [`../evals`](../evals) |
-| AgentDeck integration | [`../../../../products/agentdeck/docs/hermes-integration.md`](../../../../products/agentdeck/docs/hermes-integration.md) |
+| AgentDeck integration | [`Arconath/agentdeck/docs/hermes-integration.md`](https://github.com/Arconath/agentdeck/blob/main/docs/hermes-integration.md) |
 
 ## Reading rule
 
