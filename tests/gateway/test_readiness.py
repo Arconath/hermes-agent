@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import json
-import os
+import shutil
 import sqlite3
 from pathlib import Path
 
@@ -18,6 +17,17 @@ def test_collect_runtime_readiness_reports_healthy_local_runtime(tmp_path, monke
     with sqlite3.connect(home / "state.db") as conn:
         conn.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
     monkeypatch.setenv("HERMES_HOME", str(home))
+    # A healthy fixture must not inherit the CI runner's mount pressure.
+    total = 100 * 1024**3
+    monkeypatch.setattr(
+        shutil,
+        "disk_usage",
+        lambda _path: shutil._ntuple_diskusage(  # type: ignore[attr-defined]
+            total=total,
+            used=50 * 1024**3,
+            free=50 * 1024**3,
+        ),
+    )
 
     result = collect_runtime_readiness(
         configured_model="test/model",
@@ -91,5 +101,3 @@ def test_readiness_uses_running_session_store_state_over_independent_probe(
         },
     )
     assert recovered["checks"]["session_store"] == {"status": "ok"}
-
-
