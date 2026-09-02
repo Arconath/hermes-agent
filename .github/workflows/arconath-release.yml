@@ -1,32 +1,25 @@
-name: Arconath Hermes release intent
+name: Arconath Hermes upstream validation-only (dormant; fork identity required)
 
 on:
-  push:
-    # Tag protection is mandatory. The job guard below makes an unprotected
-    # tag a no-op, so a maintainer cannot route arbitrary tag source to the
-    # private runner by merely matching this pattern.
-    tags:
-      - v2.337.0-arconath.1-rc.1
-      - v2.337.0-arconath.1-rc.2
-      - v2.337.0-arconath.1-rc.3
-      - v2.337.0-arconath.1-rc.4
-      - v2.337.0-arconath.1-rc.5
+  # The upstream release tag is validation provenance, not a fork release.
+  # Keep this workflow visible for inspection, but do not add a push/tag event
+  # until governance creates an exact protected Arconath fork identity.
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   validate-intent:
+    # The sole event is workflow_dispatch, so this job is unreachable. Keeping
+    # the push/ref guards here makes accidental activation fail closed and
+    # prevents a manual invocation from allocating the private runner.
     if: >-
+      github.event_name == 'push' &&
       github.repository == 'Arconath/hermes-agent' &&
-      (github.ref == 'refs/tags/v2.337.0-arconath.1-rc.1' ||
-      github.ref == 'refs/tags/v2.337.0-arconath.1-rc.2' ||
-      github.ref == 'refs/tags/v2.337.0-arconath.1-rc.3' ||
-      github.ref == 'refs/tags/v2.337.0-arconath.1-rc.4' ||
-      github.ref == 'refs/tags/v2.337.0-arconath.1-rc.5') &&
+      github.ref == 'refs/tags/v2026.8.27' &&
       github.ref_type == 'tag' &&
-      github.ref_protected == true &&
-      github.event_name == 'push'
+      github.ref_protected == true
     runs-on:
       group: arconath-jit
       labels: [self-hosted, linux, x64, arconath-jit, rootless-buildkit]
@@ -43,11 +36,14 @@ jobs:
           [[ "$GITHUB_REPOSITORY" == Arconath/hermes-agent ]]
           [[ "$GITHUB_REF_TYPE" == tag ]]
           case "$GITHUB_REF" in
-            refs/tags/v2.337.0-arconath.1-rc.1|refs/tags/v2.337.0-arconath.1-rc.2|refs/tags/v2.337.0-arconath.1-rc.3|refs/tags/v2.337.0-arconath.1-rc.4|refs/tags/v2.337.0-arconath.1-rc.5) ;;
-            *) echo 'untrusted release tag' >&2; exit 1 ;;
+            refs/tags/v2026.8.27) ;;
+            *) echo 'untrusted upstream validation tag' >&2; exit 1 ;;
           esac
           [[ "$GITHUB_REF_PROTECTED" == true ]]
+          [[ "$(git rev-parse 'refs/tags/v2026.8.27^{commit}')" == "$GITHUB_SHA" ]]
+          [[ "$(git rev-parse 'refs/tags/v2026.8.27^{commit}')" == "5fc308a70719a83cccdbba4c0e39c23f5a8239d5" ]]
           [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" ]]
+          [[ -f .github/workflows/arconath-release.yml ]]
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
           [[ -z "${DOCKER_HOST:-}" ]]
           [[ -z "${CONTAINER_HOST:-}" ]]
@@ -65,6 +61,10 @@ jobs:
         run: |
           set -Eeuo pipefail
           archive="$RUNNER_TEMP/hermes-agent.oci.tar"
+          release_version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          release_date="$(python3 -c 'import re; from pathlib import Path; print(next(re.finditer(r"__release_date__\s*=\s*\"([^\"]+)\"", Path("hermes_cli/__init__.py").read_text(encoding="utf-8"))).group(1))')"
+          [[ "$release_version" == "0.20.6" ]]
+          [[ "$release_date" == "2026.8.27" ]]
           buildctl --addr "$BUILDKIT_HOST" build \
             --frontend dockerfile.v0 \
             --local context=. \
@@ -79,8 +79,11 @@ jobs:
             --arg repository "$GITHUB_REPOSITORY" \
             --arg sourceRevision "$GITHUB_SHA" \
             --arg sourceRef "$GITHUB_REF" \
+            --arg releaseTag "$GITHUB_REF_NAME" \
+            --arg releaseVersion "$release_version" \
+            --arg releaseDate "$release_date" \
             --arg archiveSha256 "sha256:$archive_sha" \
-            '{schemaVersion:1,artifactClass:"UnsignedHermesAgentReleaseIntent",deploymentAllowed:false,signatureState:"unsigned",repository:$repository,sourceRevision:$sourceRevision,sourceRef:$sourceRef,archiveSha256:$archiveSha256,publisher:"Arconath/release-control",registryHost:"registry.arconath.internal",artifactRepository:"registry.arconath.internal/arconath/hermes-agent"}' \
+            '{schemaVersion:1,artifactClass:"UnsignedHermesAgentReleaseIntent",deploymentAllowed:false,signatureState:"unsigned",repository:$repository,releaseTag:$releaseTag,releaseVersion:$releaseVersion,releaseDate:$releaseDate,sourceRevision:$sourceRevision,sourceRef:$sourceRef,archiveSha256:$archiveSha256,publisher:"Arconath/release-control",registryHost:"registry.arconath.internal",artifactRepository:"registry.arconath.internal/arconath/hermes-agent"}' \
             >"$RUNNER_TEMP/hermes-agent-release-intent.json"
           rm -- "$archive"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
